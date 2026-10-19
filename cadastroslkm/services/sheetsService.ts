@@ -1,0 +1,221 @@
+import { Incident, Student } from '../types';
+import { normalizeClassName } from '../utils/formatters';
+import { supabase } from './supabaseClient';
+
+/**
+ * Todas as leituras e gravações na planilha passam pelo servidor (/api/sheets).
+ * O navegador nunca conhece a URL do Apps Script nem o segredo do proxy (LGPD).
+ */
+const GOOGLE_SCRIPT_URL = '/api/sheets';
+
+const getAccessToken = async (): Promise<string | null> => {
+  try {
+    const { data } = await supabase.auth.getSession();
+    return data.session?.access_token ?? null;
+  } catch {
+    return null;
+  }
+};
+
+const sheetsFetch = async (url: string, init: RequestInit = {}, timeoutMs = 15000): Promise<Response> => {
+  const token = await getAccessToken();
+  const headers = new Headers(init.headers || {});
+  if (token) headers.set('Authorization', `Bearer ${token}`);
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, headers, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+const fetchWithFallback = async (url: string, timeoutMs = 15000): Promise<any> => {
+  const res = await sheetsFetch(url, { method: 'GET', headers: { Accept: 'application/json' } }, timeoutMs);
+  if (!res.ok) throw new Error(`Falha ao consultar a planilha (HTTP ${res.status})`);
+  return res.json();
+};
+
+const postToSheets = async (payload: Record<string, unknown>) => {
+  const res = await sheetsFetch(GOOGLE_SCRIPT_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error(`Falha ao gravar na planilha (HTTP ${res.status})`);
+  return res;
+};
+
+/**
+ * Carrega a lista de alunos da planilha Google Sheets.
+ * Aba: BANCODEDADOSGERAL
+ */
+export const loadStudentsFromSheets = async (): Promise<Student[]> => {
+  try {
+    const data = await fetchWithFallback(`${GOOGLE_SCRIPT_URL}?sheetName=BANCODEDADOSGERAL`);
+
+    if (data.success && Array.isArray(data.students)) {
+      console.log(`✅ Google Sheets: Carregados ${data.students.length} alunos`);
+
+      // Log detalhado de debug
+      if (data.debug) {
+        const d = data.debug;
+        console.log(`📋 Sheets debug:`, {
+          aba: d.sheetUsed,
+          linhaHeader: d.headerRow,
+          totalLinhas: d.totalRows,
+          totalColunas: d.totalCols,
+          blocosDetectados: d.classBlocksDetected?.length,
+          blocos: d.classBlocksDetected
+        });
+      }
+
+      // Log turmas encontradas
+      const turmasUnicas = [...new Set(data.students.map((s: any) => s.turma))].sort();
+      console.log(`📚 Turmas retornadas (${turmasUnicas.length}):`, turmasUnicas);
+
+      // Contagem por turma
+      const contagemPorTurma: Record<string, number> = {};
+      data.students.forEach((s: any) => {
+        contagemPorTurma[s.turma] = (contagemPorTurma[s.turma] || 0) + 1;
+      });
+      console.log('👥 Alunos por turma:', contagemPorTurma);
+
+      // Salvar turmas detectadas pelo script (mesmo sem alunos) para o dropdown
+      if (data.debug?.classBlocksDetected && Array.isArray(data.debug.classBlocksDetected)) {
+        // Extrai apenas o nome da turma antes do " (nome:..."
+        const detectedClasses: string[] = data.debug.classBlocksDetected.map(
+          (entry: string) => normalizeClassName(entry.split(' (')[0].trim())
+        );
+        (window as any).__allDetectedClasses = detectedClasses;
+        console.log(`📋 Turmas detectadas na planilha: ${detectedClasses.join(', ')}`);
+      }
+
+      return data.students;
+    }
+
+    throw new Error('Formato de resposta inválido do Google Sheets');
+  } catch (error) {
+    console.error('❌ Erro ao carregar alunos do Google Sheets:', error);
+    return [];
+  }
+};
+
+export const saveToGoogleSheets = async (incident: Incident) => {
+  try {
+    const isGestao = incident.source === 'gestao';
+    const sheetName = isGestao ? 'BANCODEALUNOS' : 'OCORRENCIASDOSPROFESSORES';
+
+    /**
+     * Usa a URL pública do PDF armazenado no Supabase Storage.
+     * Se não houver URL (upload falhou), mostra mensagem de erro.
+     */
+    console.log(`📋 Google Sheets - Aluno: ${incident.studentName}, PDF URL:`, incident.pdfUrl || 'não disponível');
+
+    const pdfLinkFormula = incident.pdfUrl
+      ? `=HYPERLINK("${incident.pdfUrl}"; "📄 ABRIR PDF")`
+      : "❌ PDF não gerado";
+
+    const values = isGestao ? [
+      incident.date,                           // 1. Data
+      incident.studentName.toUpperCase(),      // 2. Aluno
+      incident.classRoom || '---',             // 3. Turma
+      incident.professorName?.toUpperCase() || 'GESTAO', // 4. Responsável
+      incident.ra || '---',                    // 5. RA
+      incident.category || 'OCORRÊNCIA',       // 6. Categoria
+      incident.description.toUpperCase(),      // 7. Relato
+      incident.registerDate || incident.date,  // 8. Registro
+      incident.returnDate || 'N/A',            // 9. Retorno
+      pdfLinkFormula                           // 10. Link PDF
+    ] : [
+      incident.date,                           // 1. Data
+      incident.professorName?.toUpperCase() || '---', // 2. Professor
+      incident.classRoom || '---',             // 3. Turma
+      incident.studentName.toUpperCase(),      // 4. Aluno
+      incident.ra || '---',                    // 5. RA
+      incident.discipline?.toUpperCase() || 'N/A', // 6. Disciplina
+      incident.irregularities?.toUpperCase() || 'NENHUMA', // 7. Irregularidades
+      incident.description.toUpperCase(),      // 8. Relato
+      incident.time || '---',                  // 9. Horário
+      pdfLinkFormula                           // 10. Link PDF
+    ];
+
+    const payload = {
+      sheetName: sheetName,
+      values: values
+    };
+
+    await postToSheets(payload);
+
+    return true;
+  } catch (error) {
+    console.error('Erro ao sincronizar com Google Sheets:', error);
+    return false;
+  }
+};
+
+/**
+ * Avaliação do App por critérios (1 a 5 estrelas cada).
+ * Salva na aba AVALIACOESAPP da mesma planilha.
+ */
+export interface AppRatingPayload {
+  userEmail: string;
+  facilidadeUso: number;
+  velocidade: number;
+  design: number;
+  utilidade: number;
+  comentario?: string;
+}
+
+/**
+ * Verifica no backend (Apps Script) se este e-mail de professor
+ * já enviou uma avaliação do app (pelo proxy autenticado).
+ */
+export const checkIfUserHasRatedApp = async (email?: string): Promise<boolean> => {
+  if (!email) return false;
+  try {
+    const url = `${GOOGLE_SCRIPT_URL}?action=checkRating&email=${encodeURIComponent(email)}`;
+    const data = await fetchWithFallback(url);
+    return !!(data && data.success && data.hasRated);
+  } catch (err) {
+    console.error('Erro ao verificar se o professor já avaliou o app:', err);
+    // Em caso de falha na verificação, não bloqueia o botão (fail-open)
+    return false;
+  }
+};
+
+export const saveAppRatingToSheets = async (rating: AppRatingPayload) => {
+  try {
+    const now = new Date();
+    const dateStr = now.toLocaleDateString('pt-BR');
+    const timeStr = now.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+    const media = (
+      (rating.facilidadeUso + rating.velocidade + rating.design + rating.utilidade) / 4
+    ).toFixed(1);
+
+    const values = [
+      dateStr,                                  // 1. Data
+      timeStr,                                  // 2. Hora
+      rating.userEmail || '---',                // 3. E-mail do professor
+      rating.facilidadeUso,                     // 4. Facilidade de Uso
+      rating.velocidade,                         // 5. Velocidade
+      rating.design,                             // 6. Design
+      rating.utilidade,                          // 7. Utilidade no dia a dia
+      media,                                     // 8. Média Geral
+      (rating.comentario || '').toUpperCase(),  // 9. Comentário
+    ];
+
+    const payload = {
+      sheetName: 'AVALIACOESAPP',
+      values: values,
+    };
+
+    await postToSheets(payload);
+
+    return true;
+  } catch (error) {
+    console.error('Erro ao enviar avaliação do app para o Google Sheets:', error);
+    return false;
+  }
+};
